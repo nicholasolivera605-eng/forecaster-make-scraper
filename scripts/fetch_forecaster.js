@@ -1,168 +1,143 @@
 // scripts/fetch_forecaster.js
+// Scrapes Forecaster terminal chart data via headless browser (Playwright)
+// and sends rows to Make.com webhook.
 //
-// Fetches forecast series from Forecaster Terminal (ApexCharts data) for 1m + 3m,
-// then POSTs the rows to a Make.com webhook.
-//
-// Usage (GitHub Actions):
-//   node scripts/fetch_forecaster.js
-//
-// Required env vars:
-//   MAKE_WEBHOOK_URL = https://hook.us1.make.com/xxxx
-//
-// Optional env vars (defaults shown):
-//   SYMBOL=tsla
-//   EXCHANGE=nasdaq
-//   FORECAST_DATE=auto (ISO date today in UTC, e.g. 2025-12-26)
+// Output row format:
+// Ticker, Forecast_Date, Target_Date, Scenario, Predicted_Price
 
-const SYMBOL = (process.env.SYMBOL || "tsla").toLowerCase();
-const EXCHANGE = (process.env.EXCHANGE || "nasdaq").toLowerCase();
+import { chromium } from "playwright";
+
 const MAKE_WEBHOOK_URL = process.env.MAKE_WEBHOOK_URL;
-
-// Set forecast_date as YYYY-MM-DD (UTC)
-const FORECAST_DATE =
-  process.env.FORECAST_DATE ||
-  new Date().toISOString().slice(0, 10);
-
 if (!MAKE_WEBHOOK_URL) {
   console.error("Missing env var: MAKE_WEBHOOK_URL");
   process.exit(1);
 }
 
-// Convert ms timestamp to YYYY-MM-DD (UTC)
-function toYMD(ms) {
-  const d = new Date(Number(ms));
-  return d.toISOString().slice(0, 10);
+const TICKER = process.env.TICKER || "TSLA";
+
+const URLS = [
+  { horizon: "1m", url: "https://terminal.forecaster.biz/instrument/nasdaq/tsla/projection?tf=1m" },
+  { horizon: "3m", url: "https://terminal.forecaster.biz/instrument/nasdaq/tsla/projection" },
+];
+
+function toISODate(ms) {
+  // ms is epoch milliseconds
+  const d = new Date(ms);
+  // Use UTC date so it’s stable in Actions
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
 }
 
-// Scrape the projection page HTML and extract ApexCharts series data.
-async function fetchForecast(horizon) {
-  // 3m is the default page; 1m uses ?tf=1m
-  const base = `https://terminal.forecaster.biz/instrument/${EXCHANGE}/${SYMBOL}/projection`;
-  const url = horizon === "1m" ? `${base}?tf=1m` : base;
-
-  const res = await fetch(url, {
-    headers: {
-      "user-agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-      "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    },
-  });
-
-  if (!res.ok) {
-    throw new Error(`Forecaster fetch failed (${horizon}): ${res.status} ${res.statusText}`);
-  }
-
-  const html = await res.text();
-
-  // We look for the ApexCharts "series" array in the HTML.
-  // The page typically includes something like: series:[{name:"Price",data:[{x:...,y:...},...]}, ...]
-  // We'll capture the JSON-ish blob and eval it safely-ish by normalizing to JSON.
-  //
-  // 1) Find "series" block
-  const seriesMatch =
-    html.match(/series\s*:\s*(\[\s*\{[\s\S]*?\}\s*\])/m) ||
-    html.match(/"series"\s*:\s*(\[\s*\{[\s\S]*?\}\s*\])/m);
-
-  if (!seriesMatch) {
-    throw new Error(
-      `Could not locate ApexCharts series data on page (${horizon}). The page structure may have changed.`
-    );
-  }
-
-  const seriesRaw = seriesMatch[1];
-
-  // 2) Convert JS object-ish syntax to JSON:
-  // - Quote unquoted keys (x:, y:, name:, data:, type:, color:, group:)
-  // - Convert single quotes to double quotes
-  // This is best-effort; if it breaks, we can switch to a Playwright runner.
-  const seriesJsonString = seriesRaw
-    .replace(/(\w+)\s*:/g, '"$1":') // quote keys
-    .replace(/'/g, '"'); // normalize quotes
-
-  let series;
-  try {
-    series = JSON.parse(seriesJsonString);
-  } catch (e) {
-    // If JSON parsing fails, throw with a little debug.
-    throw new Error(
-      `Failed to parse series JSON (${horizon}). Error: ${e.message}`
-    );
-  }
-
-  // 3) Flatten into rows:
-  // Output format requested:
-  // Ticker, Forecast_Date, Target_Date, Scenario, Predicted_Price
-  //
-  // Scenario will be series.name, e.g. "Best Match", "Bear Scenario", "Bull Scenario"
-  // We ignore "Price" unless you want to store it too.
-  const rows = [];
-
-  for (const s of series) {
-    const scenario = s?.name || "Unknown";
-    const points = Array.isArray(s?.data) ? s.data : [];
-
-    // If points are objects like {x:..., y:...}
-    for (const p of points) {
-      if (!p || typeof p !== "object") continue;
-      if (p.x == null || p.y == null) continue;
-
-      rows.push({
-        Ticker: SYMBOL.toUpperCase(),
-        Forecast_Date: FORECAST_DATE,
-        Target_Date: toYMD(p.x),
-        Scenario: scenario,
-        Predicted_Price: Number(p.y),
-        Horizon: horizon, // keep for routing to 1m/3m sheets in Make (optional)
-      });
-    }
-  }
-
-  return rows;
+function todayUTC() {
+  const d = new Date();
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
 }
 
-async function postToMake(payload) {
-  const res = await fetch(MAKE_WEBHOOK_URL, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
+async function getSeriesFromPage(page, url, horizon) {
+  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+
+  // Wait until Apex chart instances exist (page is hydrated + chart rendered)
+  await page.waitForFunction(() => {
+    // eslint-disable-next-line no-undef
+    return typeof window !== "undefined"
+      // eslint-disable-next-line no-undef
+      && window.Apex
+      // eslint-disable-next-line no-undef
+      && Array.isArray(window.Apex._chartInstances)
+      // eslint-disable-next-line no-undef
+      && window.Apex._chartInstances.length > 0
+      // eslint-disable-next-line no-undef
+      && window.Apex._chartInstances[0]?.chart?.w?.config?.series?.length > 0;
+  }, { timeout: 60000 });
+
+  const series = await page.evaluate(() => {
+    // eslint-disable-next-line no-undef
+    const inst = window.Apex._chartInstances[0];
+    return inst.chart.w.config.series || [];
   });
 
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Make webhook failed: ${res.status} ${res.statusText}\n${text}`);
+  if (!series || !Array.isArray(series) || series.length === 0) {
+    throw new Error(`Could not locate ApexCharts series data on page (${horizon}).`);
   }
 
-  return res.text().catch(() => "");
+  return series;
 }
 
 async function main() {
+  const forecastDate = todayUTC();
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+  });
+
+  const page = await browser.newPage({
+    userAgent:
+      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+  });
+
+  const allRows = [];
+
   try {
-    const [rows1m, rows3m] = await Promise.all([
-      fetchForecast("1m"),
-      fetchForecast("3m"),
-    ]);
+    for (const item of URLS) {
+      const { horizon, url } = item;
 
-    // You can choose to keep/strip "Price" series.
-    // If you want to exclude "Price" (actual series) uncomment this filter:
-    // const filterOutPrice = (r) => r.Scenario !== "Price";
-    // const rows = [...rows1m, ...rows3m].filter(filterOutPrice);
+      const series = await getSeriesFromPage(page, url, horizon);
 
-    const rows = [...rows1m, ...rows3m];
+      for (const s of series) {
+        const scenario = s?.name || "Unknown";
+        const points = Array.isArray(s?.data) ? s.data : [];
 
-    const payload = {
-      ticker: SYMBOL.toUpperCase(),
-      exchange: EXCHANGE.toUpperCase(),
-      forecast_date: FORECAST_DATE,
-      rows,
-    };
+        for (const p of points) {
+          if (!p || typeof p.x !== "number" || typeof p.y !== "number") continue;
 
-    const resp = await postToMake(payload);
-    console.log(`✅ Sent ${rows.length} rows to Make. Response: ${resp}`);
-  } catch (err) {
-    console.error("❌ Error:", err.message);
+          allRows.push({
+            Ticker: TICKER,
+            Forecast_Date: forecastDate,
+            Target_Date: toISODate(p.x),
+            Scenario: `${horizon}:${scenario}`,
+            Predicted_Price: Number(p.y.toFixed(2)),
+          });
+        }
+      }
+    }
+  } finally {
+    await browser.close();
+  }
+
+  if (allRows.length === 0) {
+    console.error("No rows were scraped. Exiting.");
     process.exit(1);
   }
+
+  // Send to Make webhook
+  const payload = {
+    ticker: TICKER,
+    forecast_date: forecastDate,
+    rows: allRows,
+  };
+
+  const res = await fetch(MAKE_WEBHOOK_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  const text = await res.text();
+  if (!res.ok) {
+    console.error("Make webhook error:", res.status, text);
+    process.exit(1);
+  }
+
+  console.log(`✅ Sent ${allRows.length} rows to Make.`);
+  console.log(text);
 }
 
-main();
-
+main().catch((err) => {
+  console.error("❌ Scrape failed:", err?.message || err);
+  process.exit(1);
+});
