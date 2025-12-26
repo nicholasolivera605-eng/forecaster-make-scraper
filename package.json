@@ -1,0 +1,11 @@
+{
+  "name": "forecaster-make-scraper",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "postinstall": "npx playwright install chromium"
+  },
+  "dependencies": {
+    "playwright": "^1.49.0"
+  }
+}
