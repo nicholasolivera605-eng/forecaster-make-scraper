@@ -2,12 +2,13 @@ name: Forecaster Scraper
 
 on:
   schedule:
-    - cron: "0 13 * * *" # runs daily at 13:00 UTC
+    - cron: "0 13 * * *" # daily 13:00 UTC
   workflow_dispatch:
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -17,12 +18,11 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 18
+          cache: "npm"
 
-      # Install dependencies from package.json
       - name: Install deps
-        run: npm install
+        run: npm ci || npm install
 
-      # Install Playwright browser needed to run in Actions
       - name: Install Playwright Chromium
         run: npx playwright install --with-deps chromium
 
