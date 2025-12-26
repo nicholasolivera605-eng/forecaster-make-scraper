@@ -1,0 +1,27 @@
+name: Forecaster Scraper
+
+on:
+  schedule:
+    - cron: "0 13 * * *" # runs daily at 13:00 UTC
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Install deps
+        run: npm install node-fetch
+
+      - name: Run scraper
+        env:
+          MAKE_WEBHOOK_URL: ${{ secrets.MAKE_WEBHOOK_URL }}
+        run: node scripts/fetch_forecaster.js
