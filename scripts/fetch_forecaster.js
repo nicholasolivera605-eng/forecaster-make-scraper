@@ -1,11 +1,4 @@
-// scripts/fetch_forecaster.js
-// Scrapes Forecaster terminal chart data via headless browser (Playwright)
-// and sends rows to Make.com webhook.
-//
-// Output row format:
-// Ticker, Forecast_Date, Target_Date, Scenario, Predicted_Price
-
-import { chromium } from "playwright";
+import playwright from "playwright";
 
 const MAKE_WEBHOOK_URL = process.env.MAKE_WEBHOOK_URL;
 if (!MAKE_WEBHOOK_URL) {
@@ -13,131 +6,183 @@ if (!MAKE_WEBHOOK_URL) {
   process.exit(1);
 }
 
-const TICKER = process.env.TICKER || "TSLA";
+const TICKER = "TSLA";
+const BASE_URL = "https://terminal.forecaster.biz/instrument/nasdaq/tsla/projection";
 
-const URLS = [
-  { horizon: "1m", url: "https://terminal.forecaster.biz/instrument/nasdaq/tsla/projection?tf=1m" },
-  { horizon: "3m", url: "https://terminal.forecaster.biz/instrument/nasdaq/tsla/projection" },
+const timeframes = [
+  { tf: "1m", url: `${BASE_URL}?tf=1m` },
+  { tf: "3m", url: `${BASE_URL}` }, // default is 3m
 ];
 
+// converts ms timestamp -> YYYY-MM-DD
 function toISODate(ms) {
-  // ms is epoch milliseconds
   const d = new Date(ms);
-  // Use UTC date so it’s stable in Actions
   const yyyy = d.getUTCFullYear();
   const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
   const dd = String(d.getUTCDate()).padStart(2, "0");
   return `${yyyy}-${mm}-${dd}`;
 }
 
-function todayUTC() {
-  const d = new Date();
-  const yyyy = d.getUTCFullYear();
-  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const dd = String(d.getUTCDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
+// robust extractor: tries Apex internal, then scans window for {x,y} series
+function extractSeriesFromPage(result) {
+  // result is what we return from page.evaluate
+  if (result?.apexSeries?.length) return result.apexSeries;
+  if (result?.windowScanSeries?.length) return result.windowScanSeries;
+  return [];
 }
 
-async function getSeriesFromPage(page, url, horizon) {
-  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+async function scrapeOne(page, tf, url) {
+  console.log(`➡️ Loading ${tf}: ${url}`);
 
-  // Wait until Apex chart instances exist (page is hydrated + chart rendered)
-  await page.waitForFunction(() => {
-    // eslint-disable-next-line no-undef
-    return typeof window !== "undefined"
-      // eslint-disable-next-line no-undef
-      && window.Apex
-      // eslint-disable-next-line no-undef
-      && Array.isArray(window.Apex._chartInstances)
-      // eslint-disable-next-line no-undef
-      && window.Apex._chartInstances.length > 0
-      // eslint-disable-next-line no-undef
-      && window.Apex._chartInstances[0]?.chart?.w?.config?.series?.length > 0;
-  }, { timeout: 60000 });
+  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 120000 });
 
-  const series = await page.evaluate(() => {
-    // eslint-disable-next-line no-undef
-    const inst = window.Apex._chartInstances[0];
-    return inst.chart.w.config.series || [];
+  // Give it time to hydrate charts
+  await page.waitForTimeout(3000);
+
+  // Wait up to 90s for ANY evidence of chart data.
+  // We don't hardcode exact object paths because they change.
+  await page.waitForFunction(
+    () => {
+      // obvious apex global?
+      if (window.Apex && window.Apex._chartInstances && window.Apex._chartInstances.length) return true;
+
+      // common apexcharts internal objects
+      if (window.__APEXCHARTS__ && Object.keys(window.__APEXCHARTS__).length) return true;
+
+      // scan window for any array containing {x,y}
+      for (const k of Object.keys(window)) {
+        try {
+          const v = window[k];
+          if (Array.isArray(v) && v.length && v[0] && typeof v[0] === "object") {
+            // look for at least one {x: number, y: number}
+            const hit = v.find?.(o => o && typeof o === "object" && "x" in o && "y" in o);
+            if (hit && typeof hit.x === "number" && typeof hit.y === "number") return true;
+          }
+        } catch (_) {}
+      }
+      return false;
+    },
+    { timeout: 90000 }
+  );
+
+  // Pull the series out
+  const raw = await page.evaluate(() => {
+    // 1) Try Apex global
+    let apexSeries = [];
+    try {
+      if (window.Apex && window.Apex._chartInstances && window.Apex._chartInstances.length) {
+        const inst = window.Apex._chartInstances[0];
+        // in many builds this exists:
+        const s = inst?.chart?.w?.config?.series;
+        if (Array.isArray(s) && s.length) apexSeries = s;
+      }
+    } catch (e) {}
+
+    // 2) Try scanning window for arrays of {x,y}
+    // We return in a normalized "series-like" format
+    let windowScanSeries = [];
+    try {
+      const candidates = [];
+      for (const k of Object.keys(window)) {
+        try {
+          const v = window[k];
+          if (Array.isArray(v) && v.length) {
+            const hit = v.find?.(o => o && typeof o === "object" && "x" in o && "y" in o);
+            if (hit && typeof hit.x === "number" && typeof hit.y === "number") {
+              candidates.push({ key: k, data: v });
+            }
+          }
+        } catch (_) {}
+      }
+
+      // If we found at least one candidate, wrap it
+      if (candidates.length) {
+        windowScanSeries = candidates.map(c => ({
+          name: c.key,
+          data: c.data,
+        }));
+      }
+    } catch (e) {}
+
+    return { apexSeries, windowScanSeries };
   });
 
-  if (!series || !Array.isArray(series) || series.length === 0) {
-    throw new Error(`Could not locate ApexCharts series data on page (${horizon}).`);
+  const series = extractSeriesFromPage(raw);
+
+  if (!series.length) {
+    throw new Error(`Could not locate ApexCharts series data on page (${tf}).`);
   }
 
-  return series;
+  // Convert to rows for Make webhook
+  // Keep only series that have {x,y} pairs
+  const rows = [];
+  const forecastDate = new Date().toISOString().slice(0, 10);
+
+  for (const s of series) {
+    const scenario = s?.name || "Unknown";
+    const data = Array.isArray(s?.data) ? s.data : [];
+
+    for (const pt of data) {
+      if (!pt || typeof pt.x !== "number" || typeof pt.y !== "number") continue;
+
+      rows.push({
+        Ticker: TICKER,
+        Forecast_Date: forecastDate,
+        Target_Date: toISODate(pt.x),
+        Scenario: scenario,
+        Predicted_Price: Number(pt.y.toFixed(4)),
+        Timeframe: tf, // helpful for routing in Make
+      });
+    }
+  }
+
+  console.log(`✅ ${tf}: extracted ${rows.length} points`);
+  return rows;
 }
 
 async function main() {
-  const forecastDate = todayUTC();
-  const browser = await chromium.launch({
+  const browser = await playwright.chromium.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-setuid-sandbox"],
   });
 
-  const page = await browser.newPage({
-    userAgent:
-      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-  });
+  const page = await browser.newPage();
+
+  // Some sites behave differently headless; spoof a normal UA
+  await page.setUserAgent(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+  );
 
   const allRows = [];
-
   try {
-    for (const item of URLS) {
-      const { horizon, url } = item;
-
-      const series = await getSeriesFromPage(page, url, horizon);
-
-      for (const s of series) {
-        const scenario = s?.name || "Unknown";
-        const points = Array.isArray(s?.data) ? s.data : [];
-
-        for (const p of points) {
-          if (!p || typeof p.x !== "number" || typeof p.y !== "number") continue;
-
-          allRows.push({
-            Ticker: TICKER,
-            Forecast_Date: forecastDate,
-            Target_Date: toISODate(p.x),
-            Scenario: `${horizon}:${scenario}`,
-            Predicted_Price: Number(p.y.toFixed(2)),
-          });
-        }
-      }
+    for (const t of timeframes) {
+      const rows = await scrapeOne(page, t.tf, t.url);
+      allRows.push(...rows);
     }
+  } catch (err) {
+    console.error("❌ Scrape failed:", err?.message || err);
+    process.exitCode = 1;
   } finally {
     await browser.close();
   }
 
-  if (allRows.length === 0) {
-    console.error("No rows were scraped. Exiting.");
-    process.exit(1);
-  }
+  if (process.exitCode === 1) return;
 
-  // Send to Make webhook
-  const payload = {
-    ticker: TICKER,
-    forecast_date: forecastDate,
-    rows: allRows,
-  };
-
+  // Post to Make webhook
+  console.log(`➡️ Posting ${allRows.length} rows to Make webhook...`);
   const res = await fetch(MAKE_WEBHOOK_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({ rows: allRows }),
   });
 
-  const text = await res.text();
   if (!res.ok) {
-    console.error("Make webhook error:", res.status, text);
+    const txt = await res.text().catch(() => "");
+    console.error("❌ Webhook POST failed:", res.status, txt);
     process.exit(1);
   }
 
-  console.log(`✅ Sent ${allRows.length} rows to Make.`);
-  console.log(text);
+  console.log("✅ Webhook delivered successfully");
 }
 
-main().catch((err) => {
-  console.error("❌ Scrape failed:", err?.message || err);
-  process.exit(1);
-});
+main();
