@@ -18,8 +18,13 @@ jobs:
         with:
           node-version: 18
 
+      # Install dependencies from package.json
       - name: Install deps
-        run: npm install node-fetch
+        run: npm install
+
+      # Install Playwright browser needed to run in Actions
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
 
       - name: Run scraper
         env:
